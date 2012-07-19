@@ -1,40 +1,62 @@
 using System;
 using System.IO;
 using System.Net;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Threading;
 using Caliburn.Micro;
 using CookComputing.XmlRpc;
 using ICSharpCode.AvalonEdit.Document;
-using MarkPad.HyperlinkEditor;
-using MarkPad.Metaweblog;
-using MarkPad.Services.Interfaces;
+using MarkPad.Document.Controls;
+using MarkPad.DocumentSources;
+using MarkPad.DocumentSources.MetaWeblog.Service;
+using MarkPad.Events;
+using MarkPad.Infrastructure.DialogService;
+using MarkPad.PreviewControl;
 using MarkPad.Settings;
+using MarkPad.Settings.Models;
 using Ookii.Dialogs.Wpf;
+using MarkPad.Contracts;
 
 namespace MarkPad.Document
 {
-    internal class DocumentViewModel : Screen
+    public class DocumentViewModel : Screen, IDocumentViewModel, IHandle<SettingsChangedEvent>, IHandle<FileRenamedEvent>
     {
         private static readonly ILog Log = LogManager.GetLog(typeof(DocumentViewModel));
+        private const double ZoomDelta = 0.1;
+        private double zoomLevel = 1;
 
         private readonly IDialogService dialogService;
-        private readonly ISettingsService settings;
         private readonly IWindowManager windowManager;
+        private readonly ISiteContextGenerator siteContextGenerator;
+        private readonly Func<string, IMetaWeblogService> getMetaWeblog;
+        private readonly ISettingsProvider settingsProvider;
+		private readonly IDocumentParser documentParser;
 
         private readonly TimeSpan delay = TimeSpan.FromSeconds(0.5);
         private readonly DispatcherTimer timer;
 
-        private string title;
-        private string filename;
+        readonly Regex wordCountRegex = new Regex(@"[\S]+", RegexOptions.Compiled);
 
-        public DocumentViewModel(IDialogService dialogService, ISettingsService settings, IWindowManager windowManager)
+        public DocumentViewModel(
+            IDialogService dialogService, 
+            IWindowManager windowManager, 
+            ISiteContextGenerator siteContextGenerator,
+            Func<string, IMetaWeblogService> getMetaWeblog,
+            ISettingsProvider settingsProvider,
+			IDocumentParser documentParser)
         {
             this.dialogService = dialogService;
-            this.settings = settings;
             this.windowManager = windowManager;
+            this.siteContextGenerator = siteContextGenerator;
+            this.getMetaWeblog = getMetaWeblog;
+            this.settingsProvider = settingsProvider;
+            this.documentParser = documentParser;
 
-            title = "New Document";
+            FontSize = GetFontSize();
+            IndentType = settingsProvider.GetSettings<MarkPadSettings>().IndentType;
+            
+            Title = "New Document";
             Original = "";
             Document = new TextDocument();
             Post = new Post();
@@ -43,14 +65,16 @@ namespace MarkPad.Document
             timer.Interval = delay;
         }
 
+        private void UpdateWordCount()
+        {
+            WordCount = wordCountRegex.Matches(Document.Text).Count;
+        }
+
         private void TimerTick(object sender, EventArgs e)
         {
             timer.Stop();
 
-            Task.Factory.StartNew<string>(text =>
-            {
-                return DocumentParser.Parse(text.ToString());
-            }, Document.Text)
+			Task.Factory.StartNew(text => documentParser.Parse(text.ToString()), Document.Text)
             .ContinueWith(s =>
             {
                 if (s.IsFaulted)
@@ -59,33 +83,45 @@ namespace MarkPad.Document
                     return;
                 }
 
-                this.Render = s.Result;
+                var result = s.Result;
+                if (SiteContext != null)
+                {
+                    result = SiteContext.ConvertToAbsolutePaths(result);
+                }
+
+                Render = result;
+                UpdateWordCount();
             }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
         public void Open(string path)
         {
-            filename = path;
-            title = new FileInfo(path).Name;
+            FileName = path;
+            Title = new FileInfo(path).Name;
 
             var text = File.ReadAllText(path);
             Document.Text = text;
             Original = text;
 
             Update();
+            EvaluateContext();
         }
 
-        public void OpenFromWeb(Post post)
+        public void OpenFromWeb(BlogSetting selectedBlog, Post post)
         {
             Post = post;
-            title = post.permalink;
-            Document.Text = post.description;
-            Original = post.description;
+            Blog = selectedBlog;
+
+            Title = post.title ?? string.Empty;
+            Document.Text = post.description ?? string.Empty;
+            Original = post.description ?? string.Empty;
 
             Update();
+            EvaluateContext();
         }
 
-        public Post Post { get; private set; }
+        public BlogSetting Blog { get; private set; }
+        public Post? Post { get; private set; }
 
         public void Update()
         {
@@ -95,58 +131,65 @@ namespace MarkPad.Document
             NotifyOfPropertyChange(() => DisplayName);
         }
 
-        public bool Save()
+        public bool SaveAs()
         {
-            if (!HasChanges)
-                return true;
+            var path = dialogService.GetFileSavePath("Save As", "*.md", Constants.ExtensionFilter + "|All Files (*.*)|*.*");
 
-            if (string.IsNullOrEmpty(filename))
-            {
-                var path = dialogService.GetFileSavePath("Choose a location to save the document.", "*.md", Constants.ExtensionFilter + "|All Files (*.*)|*.*");
+            if (string.IsNullOrEmpty(path))
+                return false;
 
-                if (string.IsNullOrEmpty(path))
-                    return false;
+            FileName = path;
 
-                filename = path;
-                title = new FileInfo(filename).Name;
-                NotifyOfPropertyChange(() => DisplayName);
-            }
+            if (!Save())
+                return false;
 
-            try
-            {
-                File.WriteAllText(filename, Document.Text);
-                Original = Document.Text;
-            }
-            catch(Exception)
-            {
-                var saveResult = dialogService.ShowConfirmation("MarkPad", "Cannot save file",
-                                                String.Format("Do you want to save changes for {0} to a different file?", title), 
-                                                new ButtonExtras(ButtonType.Yes, "Save", "Save the file at a different location."),
-                                                new ButtonExtras(ButtonType.No, "Do not save", "The file will be considered a New Document.  The next save will prompt for a file location."));
+            Title = new FileInfo(FileName).Name;
+            NotifyOfPropertyChange(() => DisplayName);
+            EvaluateContext();
 
-                string prevFileName = filename;
-                string prevTitle = title;
-
-                title = "New Document";
-                filename = "";
-                if (saveResult)
-                {
-                    saveResult = Save();
-                    if (!saveResult)  //We decide not to save, keep existing title and filename 
-                    {
-                        title = prevTitle;
-                        filename = prevFileName;
-                    }
-                }
-
-                NotifyOfPropertyChange(() => DisplayName);
-                return saveResult;
-            }
-             
             return true;
         }
 
-        public TextDocument Document { get; set; }
+        public bool Save()
+        {
+            if (Post != null && Blog != null)
+            {
+                var postid = Post.Value.postid == null ? null : Post.Value.postid.ToString();
+                Publish(postid, Post.Value.title, Post.Value.categories, Blog);
+                return true;
+            }
+
+            if (string.IsNullOrEmpty(FileName))
+                return SaveAs();
+
+            try
+            {
+                File.WriteAllText(FileName, Document.Text);
+            }
+            catch (Exception)
+            {
+                var saveResult = dialogService.ShowConfirmation("MarkPad", "Cannot save file",
+                                                "You may not have permission to save this file to the selected location, or the location may not be currently available.",
+                                                new ButtonExtras(ButtonType.Yes, "Select a different location", "Save this file to a different location."),
+                                                new ButtonExtras(ButtonType.No, "Cancel", ""));
+
+                if (!saveResult)
+                    return false;
+
+                return SaveAs();
+            }
+
+            Original = Document.Text;
+            return true;
+        }
+
+        private void EvaluateContext()
+        {
+            SiteContext = siteContextGenerator.GetContext(FileName);
+        }
+
+        public TextDocument Document { get; private set; }
+		public string MarkdownContent { get { return Document.Text; } }
 
         public string Original { get; set; }
 
@@ -159,70 +202,146 @@ namespace MarkPad.Document
 
         public override string DisplayName
         {
-            get { return title; }
+            get { return Title; }
+        }
+
+        public string FileName { get; private set; }
+
+        public string Title { get; set; }
+
+        public bool FloatingToolbarEnabled
+        {
+            get
+            {
+                var settings = settingsProvider.GetSettings<MarkPadSettings>();
+                return settings.FloatingToolBarEnabled;
+            }
         }
 
         public override void CanClose(Action<bool> callback)
         {
-            DocumentView view = (DocumentView)this.GetView();
-
             if (!HasChanges)
             {
-                view.wb.Close();
+                CheckAndCloseView();
                 callback(true);
                 return;
             }
 
-            var saveResult = dialogService.ShowConfirmationWithCancel("MarkPad", "Save modifications.", "Do you want to save your changes to '" + title + "'?",
+            var saveResult = dialogService.ShowConfirmationWithCancel("MarkPad", "Save file", "Do you want to save the changes to '" + Title + "'?",
                 new ButtonExtras(ButtonType.Yes, "Save",
-                    string.IsNullOrEmpty(filename) ? "The file has not been saved yet" : "The file will be saved to " + Path.GetFullPath(filename)),
-                new ButtonExtras(ButtonType.No, "Don't Save", "Close the document without saving the modifications"),
-                new ButtonExtras(ButtonType.Cancel, "Cancel", "Don't close the document")
+                    string.IsNullOrEmpty(FileName) ? "The file has not been saved yet" : "The file will be saved to " + Path.GetFullPath(FileName)),
+                new ButtonExtras(ButtonType.No, "Discard", "Discard the changes to this file"),
+                new ButtonExtras(ButtonType.Cancel, "Cancel", "Cancel closing the application")
             );
-            var result = false;
 
-            // true = Yes
-            switch (saveResult)
+            if (saveResult == true)
             {
-                case true:
-                    result = Save();
-                    break;
-                case false:
-                    result = true;
-                    break;
+                var saved = Save();
+                if (saved) CheckAndCloseView();
+                callback(saved);
+                return;
             }
 
-            // Close browser if tab is being closed
-            if (result == true)
+            if (saveResult == false)
             {
-                view.wb.Close();
+                CheckAndCloseView();
+                callback(true);
+                return;
             }
 
-            callback(result);
+            callback(false);
         }
 
-        public void Print()
+        private void CheckAndCloseView()
         {
-            var view = GetView() as DocumentView;
-            if (view != null)
-            {
-                view.wb.Print();
-            }
+            var disposableSiteContext = SiteContext as IDisposable;
+            if (disposableSiteContext != null)
+                disposableSiteContext.Dispose();
         }
 
         public bool DistractionFree { get; set; }
+
+        public ISiteContext SiteContext { get; private set; }
+
+        public int WordCount { get; private set; }
+
+        public double FontSize { get; private set; }
+
+        public double ZoomLevel
+        {
+            get { return zoomLevel; }
+            set
+            {
+                zoomLevel = value;
+                FontSize = GetFontSize()*value;
+            }
+        }
+
+        public double MaxZoom
+        {
+            get { return 2; }
+        }
+
+        public double MinZoom
+        {
+            get { return 0.5; }
+        }
+
+        public IndentType IndentType { get; private set; }
+
+        /// <summary>
+        /// Get the font size that was set in the settings.
+        /// </summary>
+        /// <returns>Font size.</returns>
+        private int GetFontSize()
+        {
+            return Constants.FONT_SIZE_ENUM_ADJUSTMENT + (int)settingsProvider.GetSettings<MarkPadSettings>().FontSize;
+        }
+
+        public void ZoomIn()
+        {
+            AdjustZoom(ZoomDelta);
+        }
+
+        public void ZoomOut()
+        {
+            AdjustZoom(-ZoomDelta);
+        }
+
+        private void AdjustZoom(double delta)
+        {
+            var newZoom = ZoomLevel + delta;
+
+            if (newZoom < MinZoom)
+            {
+                //Don't cause a change if we don't have to
+                if (Math.Abs(ZoomLevel - MinZoom) < 0.1) return;
+                newZoom = MinZoom;
+            }
+            if (newZoom > MaxZoom)
+            {
+                //Don't cause a change if we don't have to
+                if (Math.Abs(ZoomLevel - MaxZoom) < 0.1)return;
+                newZoom = MaxZoom;
+            }
+
+            ZoomLevel = newZoom;
+        }
+
+        public void ZoomReset()
+        {
+            ZoomLevel = 1;
+        }
 
         public void Publish(string postid, string postTitle, string[] categories, BlogSetting blog)
         {
             if (categories == null) categories = new string[0];
 
-            var proxy = new MetaWeblog(blog.WebAPI);
+            var proxy = getMetaWeblog(blog.WebAPI);
 
             var newpost = new Post();
             try
             {
-                var renderBody = DocumentParser.GetBodyContents(Document.Text);
-
                 if (string.IsNullOrWhiteSpace(postid))
                 {
                     var permalink = DisplayName.Split('.')[0] == "New Document"
@@ -234,27 +353,21 @@ namespace MarkPad.Document
                                    permalink = permalink,
                                    title = postTitle,
                                    dateCreated = DateTime.Now,
-                                   description = blog.Language == "HTML" ? renderBody : Document.Text,
-                                   categories = categories
+                                   description = blog.Language == "HTML" ? DocumentParser.GetBodyContents(Document.Text) : Document.Text,
+                                   categories = categories,
+                                   format = blog.Language
                                };
-                    newpost.postid = proxy.NewPost(blog.BlogInfo.blogid, blog.Username, blog.Password, newpost, true);
-
-                    settings.Set(newpost.permalink, newpost);
-                    settings.Save();
+                    newpost.postid = proxy.NewPost(blog, newpost, true);
                 }
                 else
                 {
-                    newpost = proxy.GetPost(postid, blog.Username, blog.Password);
+                    newpost = proxy.GetPost(postid, blog);
                     newpost.title = postTitle;
-                    newpost.description = blog.Language == "HTML" ? renderBody : Document.Text;
+                    newpost.description = blog.Language == "HTML" ? DocumentParser.GetBodyContents(Document.Text) : Document.Text;
                     newpost.categories = categories;
                     newpost.format = blog.Language;
 
-                    proxy.EditPost(postid, blog.Username, blog.Password, newpost, true);
-
-                    //Not sure what this is doing??
-                    settings.Set(newpost.permalink, newpost);
-                    settings.Save();
+                    proxy.EditPost(postid, blog, newpost, true);
                 }
             }
             catch (WebException ex)
@@ -271,14 +384,18 @@ namespace MarkPad.Document
             }
 
             Post = newpost;
+            Blog = blog;
             Original = Document.Text;
-            title = postTitle;
+            Title = postTitle;
             NotifyOfPropertyChange(() => DisplayName);
         }
 
         public MarkPadHyperlink GetHyperlink(MarkPadHyperlink hyperlink)
         {
-            var viewModel = new HyperlinkEditorViewModel(hyperlink.Text, hyperlink.Url);
+            var viewModel = new HyperlinkEditorViewModel(hyperlink.Text, hyperlink.Url)
+                                {
+                                    IsUrlFocussed = !String.IsNullOrWhiteSpace(hyperlink.Text)
+                                };
             windowManager.ShowDialog(viewModel);
             if (!viewModel.WasCancelled)
             {
@@ -288,9 +405,40 @@ namespace MarkPad.Document
             return null;
         }
 
-        public int GetFontSize()
+        public void RefreshFont()
         {
-            return (int) settings.Get<FontSizes>(SettingsViewModel.FontSettingsKey);
+            FontSize = GetFontSize()*ZoomLevel;
+        }
+
+        public void Handle(SettingsChangedEvent message)
+        {
+            IndentType = settingsProvider.GetSettings<MarkPadSettings>().IndentType;            
+        }
+
+        public void Handle(FileRenamedEvent message)
+        {
+            if (FileName == message.OriginalFileName)
+            {
+                FileName = message.NewFileName;
+                Title = new FileInfo(FileName).Name;
+            }
+        }
+
+        public DocumentView View
+        {
+            get { return (DocumentView)GetView(); }
+        }
+
+        protected override void OnViewLoaded(object view)
+        {
+            base.OnViewLoaded(view);
+            NotifyOfPropertyChange(()=>View);
+        }
+
+        protected override void OnDeactivate(bool close)
+        {
+            if (View != null)
+                View.siteView.UndoRename();
         }
     }
 }

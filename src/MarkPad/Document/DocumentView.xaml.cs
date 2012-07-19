@@ -1,328 +1,204 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
-using System.Reflection;
-using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
-using System.Xml;
-using Awesomium.Core;
+using System.Windows.Media;
 using Caliburn.Micro;
+using ICSharpCode.AvalonEdit;
 using ICSharpCode.AvalonEdit.Document;
-using ICSharpCode.AvalonEdit.Highlighting;
-using ICSharpCode.AvalonEdit.Highlighting.Xshd;
 using ICSharpCode.AvalonEdit.Rendering;
+using MarkPad.Document.Commands;
+using MarkPad.Events;
 using MarkPad.Framework;
-using MarkPad.Framework.Events;
-using MarkPad.Services.Interfaces;
-using MarkPad.XAML;
+using MarkPad.Helpers;
+using MarkPad.Infrastructure.Plugins;
+using MarkPad.Plugins;
+using MarkPad.Settings;
+using MarkPad.Settings.Models;
+using MarkPad.Contracts;
+using System.ComponentModel.Composition;
 
 namespace MarkPad.Document
 {
-    public partial class DocumentView : IHandle<SettingsChangedEvent>
+    public partial class DocumentView : 
+		IDocumentView,
+		IHandle<SettingsChangedEvent>,
+		IHandle<PluginsChangedEvent>
     {
-        private const int NumSpaces = 4;
-        private const string Spaces = "    ";
+        MarkPadSettings settings;
+        ScrollViewer documentScrollViewer;
+        readonly ISettingsProvider settingsProvider;
+		readonly IPluginManager pluginManager;
 
-    	private readonly Regex WordSeparatorRegex = new Regex("-[^\\w]+|^'[^\\w]+|[^\\w]+'[^\\w]+|[^\\w]+-[^\\w]+|[^\\w]+'$|[^\\w]+-$|^-$|^'$|[^\\w'-]", RegexOptions.Compiled);
-    	private readonly Regex UriFinderRegex = new Regex("(http|ftp|https|mailto):\\/\\/[\\w\\-_]+(\\.[\\w\\-_]+)+([\\w\\-\\.,@?^=%&amp;:/~\\+#]*[\\w\\-\\@?^=%&amp;/~\\+#])?", RegexOptions.Compiled);
+		[ImportMany]
+		IEnumerable<IDocumentViewPlugin> documentViewPlugins;
+		IEnumerable<IDocumentViewPlugin> connectedDocumentViewPlugins = new IDocumentViewPlugin[0];
 
-        private ScrollViewer documentScrollViewer;
-        private readonly SpellCheckBackgroundRenderer spellCheckRenderer;
-        private readonly ISpellingService hunspell;
+        #region public double ScrollPercentage
+        public static DependencyProperty ScrollPercentageProperty = DependencyProperty.Register("ScrollPercentage", typeof(double), typeof(DocumentView),
+            new PropertyMetadata(default(double)));
 
-        public DocumentView()
+        public double ScrollPercentage
         {
+            get { return (double)GetValue(ScrollPercentageProperty); }
+            set { SetValue(ScrollPercentageProperty, value); }
+        }
+        #endregion
+
+        public DocumentView(
+			ISettingsProvider settingsProvider,
+			IPluginManager pluginManager)
+        {
+			this.settingsProvider = settingsProvider;
+			this.pluginManager = pluginManager;
+
+			this.pluginManager.Container.ComposeParts(this);
+			
             InitializeComponent();
+
+			UpdatePlugins();
+
             Loaded += DocumentViewLoaded;
-            wb.Loaded += WbLoaded;
-            wb.OpenExternalLink += WebControl_LinkClicked;
+            SizeChanged += DocumentViewSizeChanged;
+            markdownEditor.Editor.MouseWheel += HandleEditorMouseWheel;
 
-            SizeChanged += new SizeChangedEventHandler(DocumentViewSizeChanged);
+			Handle(new SettingsChangedEvent());
 
-            Editor.TextArea.SelectionChanged += SelectionChanged;
-
-            Editor.PreviewMouseLeftButtonUp += HandleMouseUp;
-
-            hunspell = IoC.Get<ISpellingService>();
-
-            spellCheckRenderer = new SpellCheckBackgroundRenderer();
-
-            Editor.TextArea.TextView.BackgroundRenderers.Add(spellCheckRenderer);
-            Editor.TextArea.TextView.VisualLinesChanged += TextView_VisualLinesChanged;
-
-            CommandBindings.Add(new CommandBinding(FormattingCommands.ToggleBold, (x, y) => ToggleBold(), CanEditDocument));
-            CommandBindings.Add(new CommandBinding(FormattingCommands.ToggleItalic, (x, y) => ToggleItalic(), CanEditDocument));
-            CommandBindings.Add(new CommandBinding(FormattingCommands.ToggleCode, (x, y) => ToggleCode(), CanEditDocument));
-            CommandBindings.Add(new CommandBinding(FormattingCommands.ToggleCodeBlock, (x, y) => ToggleCodeBlock(), CanEditDocument));
-            CommandBindings.Add(new CommandBinding(FormattingCommands.SetHyperlink, (x, y) => SetHyperlink(), CanEditDocument));
+            CommandBindings.Add(new CommandBinding(DisplayCommands.ZoomIn, (x, y) => ViewModel.ExecuteSafely(vm=>vm.ZoomIn())));
+            CommandBindings.Add(new CommandBinding(DisplayCommands.ZoomOut, (x, y) => ViewModel.ExecuteSafely(vm=>vm.ZoomOut())));
+            CommandBindings.Add(new CommandBinding(DisplayCommands.ZoomReset, (x, y) => ViewModel.ExecuteSafely(vm=>vm.ZoomReset())));
         }
 
-        void WebControl_LinkClicked(object sender, OpenExternalLinkEventArgs e)
+        public TextView TextView
         {
-            Process.Start(e.Url);
+            get { return Editor.TextArea.TextView; }
         }
 
-        void TextView_VisualLinesChanged(object sender, EventArgs e)
+        public TextDocument Document
         {
-            DoSpellCheck();
+            get { return Editor.Document; }
+        }
+
+        private DocumentViewModel ViewModel
+        {
+            get { return DataContext as DocumentViewModel; }
+        }
+
+		public void UpdatePlugins()
+		{
+			var enabledPlugins = documentViewPlugins.Where(p => p.Settings.IsEnabled).ToArray();
+
+			foreach (var plugin in connectedDocumentViewPlugins.Except(enabledPlugins))
+			{
+				plugin.DisconnectFromDocumentView(this);
+			}
+			foreach (var plugin in enabledPlugins.Except(connectedDocumentViewPlugins))
+			{
+				plugin.ConnectToDocumentView(this);
+			}
+
+			connectedDocumentViewPlugins = new List<IDocumentViewPlugin>(enabledPlugins);
+		}
+
+        public TextEditor Editor
+        {
+            get { return markdownEditor.Editor; }
+        }
+
+        void HandleEditorMouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            if (!Keyboard.IsKeyDown(Key.LeftCtrl) && !Keyboard.IsKeyDown(Key.RightCtrl)) return;
+            ViewModel.ExecuteSafely(vm => vm.ZoomLevel += e.Delta*0.1);
+        }
+
+        protected override void OnPreviewMouseWheel(MouseWheelEventArgs e)
+        {
+            base.OnPreviewMouseWheel(e);
+
+            if (!Keyboard.IsKeyDown(Key.LeftCtrl) && !Keyboard.IsKeyDown(Key.RightCtrl)) return;
+
+            e.Handled = true;
+
+            if (e.Delta > 0)
+                ViewModel.ExecuteSafely(vm=>vm.ZoomIn());
+            else 
+                ViewModel.ExecuteSafely(vm=>vm.ZoomOut());
+        }
+
+        private void ApplyFont()
+        {
+            markdownEditor.Editor.FontFamily = GetFontFamily();
         }
 
         void DocumentViewSizeChanged(object sender, SizeChangedEventArgs e)
         {
             // Hide web browser when the window is too small for it to make much sense
-            if (e.NewSize.Width <= 350)
-            {
-                webBrowserColumn.MaxWidth = 0;
-            }
-            else
-            {
-                webBrowserColumn.MaxWidth = double.MaxValue;
-            }
+            webBrowserColumn.MaxWidth = e.NewSize.Width <= 350 ? 0 : double.MaxValue;
         }
 
-        /// <summary>
-        /// Get the font size that was set in the settings.
-        /// </summary>
-        /// <returns>Font size.</returns>
-        private int GetFontSize()
+        private FontFamily GetFontFamily()
         {
-            return 12 + ((DocumentViewModel) DataContext).GetFontSize();
-        }
-
-        /// <summary>
-        /// Turn the font size into a zoom level for the browser.
-        /// </summary>
-        /// <returns></returns>
-        private int GetZoomLevel()
-        {
-            // The default font size 12 corresponds to 100 (which maps to 0 here); for an increment of 1, we add 50/6 to the number.
-            // For 18 we end up with 150, which looks really fine. TODO: Feel free to try to further outline this, but this is a good start.
-            var zoom = 100 + ((DocumentViewModel)DataContext).GetFontSize() * 40 / 6;
-
-            // Limit the zoom by the limits of Awesomium.NET.
-            if (zoom < 50)  zoom = 50;
-            if (zoom > 500) zoom = 500;
-            return zoom;
-        }
-
-        private void WbProcentualZoom()
-        {
-            wb.Zoom = GetZoomLevel();
-            wb.ExecuteJavascript("window.scrollTo(0," + documentScrollViewer.VerticalOffset / (documentScrollViewer.ExtentHeight - documentScrollViewer.ViewportHeight) + " * (document.body.scrollHeight - document.body.clientHeight));");
-        }
-
-        void WbLoaded(object sender, RoutedEventArgs e)
-        {
-            WbProcentualZoom();
+            var configuredSource = settings.FontFamily;
+            var fontFamily = FontHelpers.TryGetFontFamilyFromStack(configuredSource, "Segoe UI", "Arial");
+            if (fontFamily == null) throw new Exception("Cannot find configured font family or fallback fonts");
+            return fontFamily;
         }
 
         private void DocumentViewLoaded(object sender, RoutedEventArgs e)
         {
-            using (var stream = Assembly.GetEntryAssembly().GetManifestResourceStream("MarkPad.Syntax.Markdown.xshd"))
-            using (var reader = new XmlTextReader(stream))
-            {
-                Editor.SyntaxHighlighting = HighlightingLoader.Load(reader, HighlightingManager.Instance);
-            }
-
-            documentScrollViewer = Editor.FindVisualChild<ScrollViewer>();
+            documentScrollViewer = markdownEditor.FindVisualChild<ScrollViewer>();
 
             if (documentScrollViewer != null)
             {
-                documentScrollViewer.ScrollChanged += (i, j) => WbProcentualZoom();
-                var x = ((DocumentViewModel)DataContext);
-                x.Document.TextChanged += (i, j) =>
-                    {
-                        Editor.FontSize = GetFontSize();
-                        wb.LoadCompleted += (k, l) => WbProcentualZoom();
-                    };
-            }
-
-            // AvalonEdit hijacks Ctrl+I. We need to free that mutha up
-            var editCommandBindings = Editor.TextArea.DefaultInputHandler.Editing.CommandBindings;
-
-            editCommandBindings
-                .FirstOrDefault(b => b.Command == ICSharpCode.AvalonEdit.AvalonEditCommands.IndentSelection)
-                .ExecuteSafely(b => editCommandBindings.Remove(b));
-
-            // Set font size and focus on the editor.
-            Editor.FontSize = GetFontSize();
-            Editor.Focus();
-
-            // Set zoom level of the preview.
-            wb.Zoom = GetZoomLevel();
-        }
-
-        private void DoSpellCheck()
-        {
-            if (this.Editor.TextArea.TextView.VisualLinesValid)
-            {
-                this.spellCheckRenderer.ErrorSegments.Clear();
-
-                IEnumerable<VisualLine> visualLines = Editor.TextArea.TextView.VisualLines.AsParallel();
-
-                foreach (VisualLine currentLine in visualLines)
-                {
-                    int startIndex = 0;
-
-                    string originalText = Editor.Document.GetText(currentLine.FirstDocumentLine.Offset, currentLine.LastDocumentLine.EndOffset - currentLine.FirstDocumentLine.Offset);
-                    originalText = Regex.Replace(originalText, "[\\u2018\\u2019\\u201A\\u201B\\u2032\\u2035]", "'");
-
-                    var textWithoutURLs = UriFinderRegex.Replace(originalText, "");
-
-                    var query = WordSeparatorRegex.Split(textWithoutURLs)
-                        .Where(s => !string.IsNullOrEmpty(s));
-
-                    foreach (var word in query)
-                    {
-                        string trimmedWord = word.Trim('\'', '_', '-');
-
-                        int num = currentLine.FirstDocumentLine.Offset + originalText.IndexOf(trimmedWord, startIndex);
-
-                        if (!hunspell.Spell(trimmedWord))
-                        {
-                            TextSegment textSegment = new TextSegment();
-                            textSegment.StartOffset = num;
-                            textSegment.Length = word.Length;
-                            this.spellCheckRenderer.ErrorSegments.Add(textSegment);
-                        }
-
-                        startIndex = originalText.IndexOf(word, startIndex) + word.Length;
-                    }
-                }
+                documentScrollViewer.ScrollChanged += DocumentScrollViewerOnScrollChanged;
             }
         }
 
-        internal void ToggleBold()
+        private void DocumentScrollViewerOnScrollChanged(object sender, ScrollChangedEventArgs scrollChangedEventArgs)
         {
-            var selectedText = GetSelectedText();
-            if (string.IsNullOrWhiteSpace(selectedText)) return;
-
-            Editor.SelectedText = selectedText.ToggleBold(!selectedText.IsBold());
+            ScrollPercentage = documentScrollViewer.VerticalOffset / (documentScrollViewer.ExtentHeight - documentScrollViewer.ViewportHeight);
         }
 
-        internal void ToggleItalic()
+        public void Handle(SettingsChangedEvent message)
         {
-            var selectedText = GetSelectedText();
-            if (string.IsNullOrWhiteSpace(selectedText)) return;
+            settings = settingsProvider.GetSettings<MarkPadSettings>();
+            markdownEditor.FloatingToolbarEnabled = settings.FloatingToolBarEnabled;
 
-            Editor.SelectedText = selectedText.ToggleItalic(!selectedText.IsItalic());
+            //TODO this whole settings handler needs to be moved into viewmodel.
+            ApplyFont();
+            markdownEditor.Editor.TextArea.TextView.Redraw();
+            ViewModel.ExecuteSafely(vm => vm.RefreshFont());
         }
 
-        internal void ToggleCode()
-        {
-            if (Editor.SelectedText.Contains(Environment.NewLine))
-                ToggleCodeBlock();
-            else
-            {
-                var selectedText = GetSelectedText();
-                if (string.IsNullOrWhiteSpace(selectedText)) return;
+		public void Handle(PluginsChangedEvent e)
+		{
+			UpdatePlugins();
+		}
 
-                Editor.SelectedText = selectedText.ToggleCode(!selectedText.IsCode());
-            }
+        void PlaceHolderSizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            PreviewWidth = previewPlaceHolder.ActualWidth;
+            PreviewHeight = previewPlaceHolder.ActualHeight;
         }
 
-        private string GetSelectedText()
-        {
-            var textArea = Editor.TextArea;
-            // What would you do if the selected text is empty? I vote: Nothing.
-            if (textArea.Selection.IsEmpty)
-                return null;
+        public static readonly DependencyProperty PreviewWidthProperty =
+            DependencyProperty.Register("PreviewWidth", typeof (double), typeof (DocumentView), new PropertyMetadata(default(double)));
 
-            return textArea.Selection.GetText(textArea.Document);
+        public double PreviewWidth
+        {
+            get { return (double) GetValue(PreviewWidthProperty); }
+            set { SetValue(PreviewWidthProperty, value); }
         }
 
-        private void ToggleCodeBlock()
+        public static readonly DependencyProperty PreviewHeightProperty =
+            DependencyProperty.Register("PreviewHeight", typeof (double), typeof (DocumentView), new PropertyMetadata(default(double)));
+
+        public double PreviewHeight
         {
-            var lines = Editor.SelectedText.Split(Environment.NewLine.ToCharArray());
-            if (lines[0].Length > 4)
-            {
-                if (lines[0].Substring(0, 4) == Spaces)
-                {
-                    Editor.SelectedText = Editor.SelectedText.Replace((Environment.NewLine + Spaces), Environment.NewLine);
-
-                    // remember the first line
-                    if (Editor.SelectedText.Length >= NumSpaces)
-                    {
-                        var firstFour = Editor.SelectedText.Substring(0, NumSpaces);
-                        var rest = Editor.SelectedText.Substring(NumSpaces);
-
-                        Editor.SelectedText = firstFour.Replace(Spaces, string.Empty) + rest;
-                    }
-                    return;
-                }
-            }
-
-            Editor.SelectedText = Spaces + Editor.SelectedText.Replace(Environment.NewLine, Environment.NewLine + Spaces);
-        }
-
-        internal void SetHyperlink()
-        {
-            var textArea = Editor.TextArea;
-            if (textArea.Selection.IsEmpty)
-                return;
-
-            var selectedText = textArea.Selection.GetText(textArea.Document);
-
-            //  Check if the selected text already is a link...
-            string text = selectedText, url = string.Empty;
-            var match = Regex.Match(selectedText, @"\[(?<text>(?:[^\\]|\\.)+)\]\((?<url>[^)]+)\)");
-            if (match.Success)
-            {
-                text = match.Groups["text"].Value;
-                url = match.Groups["url"].Value;
-            }
-            var hyperlink = new MarkPadHyperlink(text, url);
-
-            (DataContext as DocumentViewModel)
-                .ExecuteSafely(vm =>
-                                   {
-                                       hyperlink = vm.GetHyperlink(hyperlink);
-									   if (hyperlink != null)
-									   {
-									   		textArea.Selection.ReplaceSelectionWithText(textArea,
-									   			string.Format("[{0}]({1})", hyperlink.Text, hyperlink.Url));
-									   }
-                                   });
-        }
-
-        private void SelectionChanged(object sender, EventArgs e)
-        {
-            if (Editor.TextArea.Selection.IsEmpty)
-            {
-                floatingToolBar.Hide();
-            }
-        }
-
-        private void HandleMouseUp(object sender, MouseButtonEventArgs e)
-        {
-            if (Editor.TextArea.Selection.IsEmpty)
-            {
-                floatingToolBar.Hide();
-            }
-            else
-            {
-                floatingToolBar.Show();
-            }
-        }
-
-        private void CanEditDocument(object sender, CanExecuteRoutedEventArgs e)
-        {
-            if (Editor != null && Editor.TextArea != null && Editor.TextArea.Selection != null)
-            {
-                e.CanExecute = !Editor.TextArea.Selection.IsEmpty;
-            }
-        }
-
-        void IHandle<SettingsChangedEvent>.Handle(SettingsChangedEvent message)
-        {
-            DoSpellCheck();
-            Editor.TextArea.TextView.Redraw();
-
-            Editor.FontSize = GetFontSize();
-            wb.Zoom = GetZoomLevel();
+            get { return (double) GetValue(PreviewHeightProperty); }
+            set { SetValue(PreviewHeightProperty, value); }
         }
     }
 }
